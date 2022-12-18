@@ -18,14 +18,14 @@ Xr_Subsystem :: struct {
 xr_init_instance :: proc() -> (instance: xr.Instance) {
 	extension_names := [?]cstring{xr.KHR_VULKAN_ENABLE2_EXTENSION_NAME}
 	application_info := xr.ApplicationInfo {
-		apiVersion         = xr_version(1, 0, 25),
-		applicationName    = xr_string(APPLICATION_NAME, 128),
+		apiVersion         = xr.CURRENT_API_VERSION,
+		applicationName    = xr.make_string(APPLICATION_NAME, 128),
 		applicationVersion = 1,
-		engineName         = xr_string(ENGINE_NAME, 128),
+		engineName         = xr.make_string(ENGINE_NAME, 128),
 		engineVersion      = 1,
 	}
 	instance_info := xr.InstanceCreateInfo {
-		sType                  = .INSTANCE_CREATE_INFO,
+		sType                 = .INSTANCE_CREATE_INFO,
 		applicationInfo       = application_info,
 		enabledExtensionCount = len(extension_names),
 		enabledExtensionNames = &extension_names[0],
@@ -38,50 +38,88 @@ xr_init_instance :: proc() -> (instance: xr.Instance) {
 }
 
 xr_get_system_and_properties :: proc(instance: xr.Instance) -> (system: xr.SystemId, properties: xr.SystemProperties) {
-	// Get OpenXR System
-	xr_system: xr.SystemId
-	{
-		system_info := xr.SystemGetInfo {
-			sType       = .SYSTEM_GET_INFO,
-			formFactor = .HEAD_MOUNTED_DISPLAY,
-		}
-		err := xr.GetSystem(instance, &system_info, &xr_system)
-		if err != .SUCCESS {panic("failed to get system")}
+	system_info := xr.SystemGetInfo {
+		sType      = .SYSTEM_GET_INFO,
+		formFactor = .HEAD_MOUNTED_DISPLAY,
+	}
+	err := xr.GetSystem(instance, &system_info, &system)
+	if err != .SUCCESS {
+		panic("failed to get system")
 	}
 
-	xr_system_props: xr.SystemProperties
-	{
-		err := xr.GetSystemProperties(instance, xr_system, &xr_system_props)
-		if err != .SUCCESS {panic("failed to get system properties")}
-
-		using xr_system_props
-		fmt.printf("System properties for system %v: \"%s\", vendor ID %v\n", systemId, systemName, vendorId)
-		fmt.printf("\tMax layers          : %d\n", graphicsProperties.maxLayerCount)
-		fmt.printf("\tMax swapchain height: %d\n", graphicsProperties.maxSwapchainImageHeight)
-		fmt.printf("\tMax swapchain width : %d\n", graphicsProperties.maxSwapchainImageWidth)
-		fmt.printf("\tOrientation Tracking: %d\n", trackingProperties.orientationTracking)
-		fmt.printf("\tPosition Tracking   : %d\n", trackingProperties.positionTracking)
+	err = xr.GetSystemProperties(instance, system, &properties)
+	if err != .SUCCESS {
+		panic("failed to get system properties")
 	}
+
+	return
+}
+
+xr_get_view_configs :: proc(
+	instance: xr.Instance,
+	system: xr.SystemId,
+) -> (
+	view_confs: [4]xr.ViewConfigurationView,
+	view_count: u32,
+) {
+	conf_type := xr.ViewConfigurationType.PRIMARY_STEREO
+	err := xr.EnumerateViewConfigurationViews(instance, system, conf_type, 0, &view_count, nil)
+	if err != .SUCCESS {
+		panic("failed to enumerate configuration views")
+	}
+
+	err = xr.EnumerateViewConfigurationViews(instance, system, conf_type, 4, &view_count, &view_confs[0])
+	if err != .SUCCESS {
+		panic("failed to enumerate configuration views")
+	}
+
 	return
 }
 
 xr_get_max_vulkan_version :: proc(instance: xr.Instance, system: xr.SystemId) {
-        requirements: xr.GraphicsRequirementsVulkanKHR
-	xr.GetVulkanGraphicsRequirementsKHR(instance, system, &requirements)
-        // requirements: xr.GraphicsRequirementsVulkan2KHR
-        // result := xr.get_vulkan_graphics_requirements2_khr(instance, system, &requirements)
-        // if result != .Success {
-        //         panic("Failed to get Vulkan requirements from OpenXR")
-        // }
-        fmt.println(requirements)
+	requirements: xr.GraphicsRequirementsVulkanKHR
+	fmt.println("here")
+	result := xr.GetVulkanGraphicsRequirements2KHR(instance, system, &requirements)
+	fmt.println("here")
+	if result != .SUCCESS {
+		panic("Failed to get Vulkan requirements from OpenXR")
+	}
+	fmt.println(requirements)
+}
+
+xr_init_session :: proc(instance: xr.Instance, system: xr.SystemId) -> (session: xr.Session) {
+	graphics_binding := xr.GraphicsBindingVulkanKHR {
+		sType = .GRAPHICS_BINDING_VULKAN_KHR,
+		// instance: vk.Instance,
+		// physicalDevice: vk.PhysicalDevice,
+		// device: vk.Device,
+		// queueFamilyIndex: u32,
+		// queueIndex: u32,
+	}
+	session_info := xr.SessionCreateInfo {
+		sType    = .SESSION_CREATE_INFO,
+		next     = &graphics_binding,
+		systemId = system,
+	}
+	err := xr.CreateSession(instance, &session_info, &session)
+	if err != .SUCCESS {
+		panic("failed to create session")
+	}
+	return
 }
 
 xr_subsystem_init :: proc() -> (subsytem: Xr_Subsystem) {
+	// TODO: Setup Debug logger
+	// TODO: Vulkan init before Session init
+
 	xr.load_base_procs()
 	instance := xr_init_instance()
 	xr.load_instance_procs(instance)
 	system, system_properties := xr_get_system_and_properties(instance)
-        xr_get_max_vulkan_version(instance, system)
+	xr_get_max_vulkan_version(instance, system)
+	view_confs, view_count := xr_get_view_configs(instance, system)
+
+	session := xr_init_session(instance, system)
 
 	subsytem = Xr_Subsystem {
 		instance          = instance,
@@ -97,12 +135,6 @@ xr_subsystem_quit :: proc(subsytem: ^Xr_Subsystem) {
 }
 
 // Utilities
-
-@(private = "file")
-xr_version :: proc(major, minor, patch: u64) -> u64 {
-	return (((major) & 0xffff) << 48) | (((minor) & 0xffff) << 32) | ((patch) & 0xffffffff)
-}
-
 @(private = "file")
 xr_proj :: proc(fov: xr.Fovf, near: f32, far: f32) -> (proj: matrix[4, 4]f32) {
 	left := math.tan(fov.angleLeft)
@@ -118,11 +150,4 @@ xr_proj :: proc(fov: xr.Fovf, near: f32, far: f32) -> (proj: matrix[4, 4]f32) {
 		0, 0, -1, 0, 
 	}
 	return
-}
-
-@(private = "file")
-xr_string :: proc(str: string, $n: int) -> [n]u8 {
-	result: [n]u8
-	copy(result[:], str)
-	return result
 }
