@@ -36,7 +36,7 @@ ProcDebugUtilsMessengerCallbackEXT :: #type proc "c" (
 	messageTypes: DebugUtilsMessageTypeFlagsEXT,
 	callbackData: ^DebugUtilsMessengerCallbackDataEXT,
 	userData: rawptr,
-) -> rawptr
+) -> b32
 // Base constants
 MAX_EXTENSION_NAME_SIZE :: 128
 MAX_API_LAYER_NAME_SIZE :: 256
