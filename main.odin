@@ -14,4 +14,8 @@ main :: proc() {
 	// for !eng.quit {
 	// 	engine_run(&eng)
 	// }
+
+	for {
+		xr_frame(&xr_subsystem)
+	}
 }
