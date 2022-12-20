@@ -17,9 +17,6 @@ VK_DEVICE_LAYERS := [?]cstring{"VK_LAYER_KHRONOS_validation"}
 
 // OpenXR Substem
 Xr_Subsystem :: struct {
-	// Interned strings
-	intern:             strings.Intern,
-
 	// OpenXR Resources
 	openxr:             xr.Instance,
 	debug_messenger:    xr.DebugUtilsMessengerEXT,
@@ -66,7 +63,7 @@ xr_decompose_version :: proc(version: u64) -> (major, minor, patch: u64) {
 
 // Builds a slice of OpenXR instance extensions based on the desired defaults, and the available ones. Crashes if any of our
 // requested extensions aren't available.
-xr_instance_extensions :: proc(intern: ^strings.Intern) -> (extensions: []cstring) {
+xr_instance_extensions :: proc() -> (extensions: []cstring) {
 	// Query available extensions
 	available_count: u32
 	xr.EnumerateInstanceExtensionProperties(nil, 0, &available_count, nil)
@@ -89,8 +86,7 @@ xr_instance_extensions :: proc(intern: ^strings.Intern) -> (extensions: []cstrin
 	// Copy and return the extensions
 	extensions = make([]cstring, len(XR_INSTANCE_EXTENSIONS))
 	for ext, i in &extensions {
-		cstr, err := strings.intern_get_cstring(intern, string(XR_INSTANCE_EXTENSIONS[i]))
-		ext = cstr
+		ext = strings.clone_to_cstring(string(XR_INSTANCE_EXTENSIONS[i]))
 	}
 
 	return
@@ -98,13 +94,7 @@ xr_instance_extensions :: proc(intern: ^strings.Intern) -> (extensions: []cstrin
 
 // Builds a slice of Vulkan instance extensions based on our desired ones, the ones requested by OpenXR, and the ones that are
 // available. Skips unavailable ones requested by OpenXR and crashes if ours aren't available.
-vk_instance_extensions :: proc(
-	instance: xr.Instance,
-	system: xr.SystemId,
-	intern: ^strings.Intern,
-) -> (
-	extensions: []cstring,
-) {
+vk_instance_extensions :: proc(instance: xr.Instance, system: xr.SystemId) -> (extensions: []cstring) {
 	// Query available extensions
 	available_count: u32
 	vk.EnumerateInstanceExtensionProperties(nil, &available_count, nil)
@@ -133,8 +123,7 @@ vk_instance_extensions :: proc(
 			break
 		}
 		if !is_available {panic(fmt.aprintf("Vulkan Instance Extension {} unavailable.", desired))}
-		cstr, err := strings.intern_get_cstring(intern, string(desired))
-		append(&extensions_dyn, cstr)
+		append(&extensions_dyn, strings.clone_to_cstring(string(desired)))
 	}
 
 	for req in requested {
@@ -149,8 +138,7 @@ vk_instance_extensions :: proc(
 		// Thanks to a cool bug where OpenXR requests extensions it doesn't have!
 		// This causes KHR_enable_vulkan2 to crash internally on device creation so we're doing it manually!
 		if !is_available {continue}
-		cstr, err := strings.intern_get_cstring(intern, string(reqc))
-		append(&extensions_dyn, cstr)
+		append(&extensions_dyn, strings.clone_to_cstring(string(reqc)))
 	}
 
 	// Build and return our extension list
@@ -165,7 +153,6 @@ vk_device_extensions :: proc(
 	instance: xr.Instance,
 	system: xr.SystemId,
 	physical_device: vk.PhysicalDevice,
-	intern: ^strings.Intern,
 ) -> (
 	extensions: []cstring,
 ) {
@@ -197,14 +184,12 @@ vk_device_extensions :: proc(
 			break
 		}
 		if !is_available {panic(fmt.aprintf("Vulkan Device Extension {} unavailable.", desired))}
-		cstr, err := strings.intern_get_cstring(intern, string(desired))
-		append(&extensions_dyn, cstr)
+		append(&extensions_dyn, strings.clone_to_cstring(string(desired)))
 	}
 
 	for req in requested {
 		is_available := false
 		reqc := strings.clone_to_cstring(req)
-		defer delete(reqc)
 		for avail in &available {
 			if reqc != cstring(&avail.extensionName[0]) {continue}
 			is_available = true
@@ -213,8 +198,7 @@ vk_device_extensions :: proc(
 		// Thanks to a cool bug where OpenXR requests extensions it doesn't have!
 		// This causes KHR_enable_vulkan2 to crash internally on device creation so we're doing it manually!
 		if !is_available {continue}
-		cstr, err := strings.intern_get_cstring(intern, string(reqc))
-		append(&extensions_dyn, cstr)
+		append(&extensions_dyn, reqc)
 	}
 
 	// Build and return our extension list
@@ -225,9 +209,16 @@ vk_device_extensions :: proc(
 
 
 @(private = "file")
-xr_init_instance :: proc(intern: ^strings.Intern) -> (instance: xr.Instance) {
+xr_init_instance :: proc() -> (instance: xr.Instance) {
 	xr.load_base_procs()
-	extension_names := xr_instance_extensions(intern)
+	extension_names := xr_instance_extensions()
+	defer {
+		for name in extension_names {
+			delete(name)
+		}
+		delete(extension_names)
+	}
+
 	application_info := xr.ApplicationInfo {
 		apiVersion         = xr.CURRENT_API_VERSION,
 		applicationName    = xr.make_string(APPLICATION_NAME, 128),
@@ -296,13 +287,7 @@ xr_get_view_configs :: proc(instance: xr.Instance, system: xr.SystemId) -> (view
 
 	return
 }
-xr_create_vulkan_instance :: proc(
-	instance: xr.Instance,
-	system: xr.SystemId,
-	intern: ^strings.Intern,
-) -> (
-	vk_instance: vk.Instance,
-) {
+xr_create_vulkan_instance :: proc(instance: xr.Instance, system: xr.SystemId) -> (vk_instance: vk.Instance) {
 	// Check our desired Vulkan version is available (it's not... which is why we're using 1.2)
 	requirements: xr.GraphicsRequirementsVulkanKHR
 	result := xr.GetVulkanGraphicsRequirementsKHR(instance, system, &requirements)
@@ -313,8 +298,13 @@ xr_create_vulkan_instance :: proc(
 	vk.load_proc_addresses_global(rawptr(vkGetInstanceProcAddr))
 
 	// Build our list of instance extension
-	extension_names := vk_instance_extensions(instance, system, intern)
-	defer delete(extension_names)
+	extension_names := vk_instance_extensions(instance, system)
+	defer {
+		for name in extension_names {
+			delete(name)
+		}
+		delete(extension_names)
+	}
 
 	application_info := vk.ApplicationInfo {
 		sType              = .APPLICATION_INFO,
@@ -344,7 +334,6 @@ xr_create_vulkan_device :: proc(
 	instance: xr.Instance,
 	system: xr.SystemId,
 	vk_instance: vk.Instance,
-	intern: ^strings.Intern,
 ) -> (
 	device: vk.Device,
 	physical_device: vk.PhysicalDevice,
@@ -352,8 +341,13 @@ xr_create_vulkan_device :: proc(
 	result := xr.GetVulkanGraphicsDeviceKHR(instance, system, vk_instance, &physical_device)
 	if result != .SUCCESS {panic("Failed to get Vulkan PhysicalDevice")}
 
-	extension_names := vk_device_extensions(instance, system, physical_device, intern)
-	defer delete(extension_names)
+	extension_names := vk_device_extensions(instance, system, physical_device)
+	defer {
+		for name in extension_names {
+			delete(name)
+		}
+		delete(extension_names)
+	}
 
 	// TODO: actually query queue families
 	queue_index: u32 = 0
@@ -746,16 +740,13 @@ create_command_buffers :: proc(device: vk.Device, command_pool: vk.CommandPool) 
 }
 
 xr_subsystem_init :: proc() -> (subsytem: Xr_Subsystem) {
-	intern: strings.Intern
-	strings.intern_init(&intern)
-
 	vk.load_proc_addresses_global(rawptr(vkGetInstanceProcAddr))
-	openxr := xr_init_instance(&intern)
+	openxr := xr_init_instance()
 	debug_messenger := xr_create_debug_messenger(openxr)
 	system, system_properties := xr_get_system_and_properties(openxr)
 	view_confs := xr_get_view_configs(openxr, system)
-	vulkan := xr_create_vulkan_instance(openxr, system, &intern)
-	device, physical_device := xr_create_vulkan_device(openxr, system, vulkan, &intern)
+	vulkan := xr_create_vulkan_instance(openxr, system)
+	device, physical_device := xr_create_vulkan_device(openxr, system, vulkan)
 	session := xr_init_session(openxr, system, vulkan, physical_device, device)
 	space := xr_init_space(session)
 	colour_format, depth_format := xr_query_formats(session)
@@ -777,7 +768,6 @@ xr_subsystem_init :: proc() -> (subsytem: Xr_Subsystem) {
 	// release image
 
 	subsytem = Xr_Subsystem {
-		intern             = intern,
 		openxr             = openxr,
 		debug_messenger    = debug_messenger,
 		system             = system,
