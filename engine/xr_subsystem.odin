@@ -34,6 +34,7 @@ Xr_Subsystem :: struct {
 	space:              xr.Space,
 	colour_swapchains:  []xr.Swapchain,
 	depth_swapchains:   []xr.Swapchain,
+	action_set:         xr.ActionSet,
 
 	// Vulkan Resources
 	vulkan:             vk.Instance,
@@ -335,8 +336,10 @@ xr_create_vulkan_instance :: proc(instance: xr.Instance, system: xr.SystemId) ->
 		pApplicationInfo        = &application_info,
 		enabledExtensionCount   = u32(len(extension_names)),
 		ppEnabledExtensionNames = &extension_names[0],
-		enabledLayerCount       = len(VK_INSTANCE_LAYERS),
-		ppEnabledLayerNames     = &VK_INSTANCE_LAYERS[0],
+	}
+	when ODIN_DEBUG {
+		instance_info.enabledLayerCount = len(VK_INSTANCE_LAYERS)
+		instance_info.ppEnabledLayerNames = &VK_INSTANCE_LAYERS[0]
 	}
 	vk_result := vk.CreateInstance(&instance_info, nil, &vk_instance)
 	if vk_result != .SUCCESS {panic("Vulkan instance creation failed")}
@@ -399,10 +402,12 @@ xr_create_vulkan_device :: proc(
 		queueCreateInfoCount    = 1,
 		pQueueCreateInfos       = &queue_create_info,
 		pEnabledFeatures        = &vk.PhysicalDeviceFeatures{},
-		enabledLayerCount       = len(VK_DEVICE_LAYERS),
-		ppEnabledLayerNames     = &VK_DEVICE_LAYERS[0],
 		enabledExtensionCount   = u32(len(extension_names)),
 		ppEnabledExtensionNames = &extension_names[0],
+	}
+	when ODIN_DEBUG {
+		device_create_info.enabledLayerCount = len(VK_DEVICE_LAYERS)
+		device_create_info.ppEnabledLayerNames = &VK_DEVICE_LAYERS[0]
 	}
 	vkresult := vk.CreateDevice(physical_device, &device_create_info, nil, &device)
 	if vkresult != .SUCCESS {
@@ -794,6 +799,150 @@ create_fence :: proc(device: vk.Device) -> (fence: vk.Fence) {
 	return
 }
 
+
+init_action_set :: proc(openxr: xr.Instance, session: xr.Session) -> (action_set: xr.ActionSet) {
+	result: xr.Result
+
+	// Set up some paths
+	hand_paths: [2]xr.Path
+	select_click_paths: [2]xr.Path
+	trigger_value_paths: [2]xr.Path
+	thumbstick_y_paths: [2]xr.Path
+	grip_pose_paths: [2]xr.Path
+	haptic_paths: [2]xr.Path
+	xr.StringToPath(openxr, "/user/hand/left", &hand_paths[0])
+	xr.StringToPath(openxr, "/user/hand/right", &hand_paths[1])
+	xr.StringToPath(openxr, "/user/hand/left/input/select/click", &select_click_paths[0])
+	xr.StringToPath(openxr, "/user/hand/right/input/select/click", &select_click_paths[1])
+	xr.StringToPath(openxr, "/user/hand/left/input/trigger/value", &trigger_value_paths[0])
+	xr.StringToPath(openxr, "/user/hand/right/input/trigger/value", &trigger_value_paths[1])
+	xr.StringToPath(openxr, "/user/hand/left/input/thumbstick/y", &thumbstick_y_paths[0])
+	xr.StringToPath(openxr, "/user/hand/right/input/thumbstick/y", &thumbstick_y_paths[1])
+	xr.StringToPath(openxr, "/user/hand/left/input/grip/pose", &grip_pose_paths[0])
+	xr.StringToPath(openxr, "/user/hand/right/input/grip/pose", &grip_pose_paths[1])
+	xr.StringToPath(openxr, "/user/hand/left/output/haptic", &haptic_paths[0])
+	xr.StringToPath(openxr, "/user/hand/right/output/haptic", &haptic_paths[1])
+
+	// Create Action Set and fill it with Actions
+	action_set_info := xr.ActionSetCreateInfo {
+		sType                  = .ACTION_SET_CREATE_INFO,
+		actionSetName          = xr.make_string("gameplay_actionset", 64),
+		localizedActionSetName = xr.make_string("Gameplay Actions", 128),
+	}
+	result = xr.CreateActionSet(openxr, &action_set_info, &action_set)
+	if result != .SUCCESS {panic("Failed to create action sets")}
+
+	hand_pose_action: xr.Action
+	hand_pose_info := xr.ActionCreateInfo {
+		sType               = .ACTION_CREATE_INFO,
+		actionType          = .POSE_INPUT,
+		actionName          = xr.make_string("handpose", 64),
+		localizedActionName = xr.make_string("Hand Pose", 128),
+		countSubactionPaths = 2,
+		subactionPaths      = &hand_paths[0],
+	}
+	result = xr.CreateAction(action_set, &hand_pose_info, &hand_pose_action)
+	if result != .SUCCESS {panic("Failed to create hand pose action")}
+
+	hand_pose_spaces: [2]xr.Space
+	hand_pose_space_info := xr.ActionSpaceCreateInfo {
+		sType = .ACTION_SPACE_CREATE_INFO,
+		action = hand_pose_action,
+		poseInActionSpace = {orientation = {x = 0, y = 0, z = 0, w = 1}, position = {x = 0, y = 0, z = 0}},
+	}
+	for i in 0 ..< 2 {
+		hand_pose_space_info.subactionPath = hand_paths[i]
+		result = xr.CreateActionSpace(session, &hand_pose_space_info, &hand_pose_spaces[i])
+		if result != .SUCCESS {panic("Failed to create hand pose space")}
+	}
+
+	grab_action_float: xr.Action
+	grab_action_info := xr.ActionCreateInfo {
+		sType               = .ACTION_CREATE_INFO,
+		actionType          = .FLOAT_INPUT,
+		actionName          = xr.make_string("grabobjectfloat", 64),
+		localizedActionName = xr.make_string("Grab Object", 128),
+		countSubactionPaths = 2,
+		subactionPaths      = &hand_paths[0],
+	}
+	result = xr.CreateAction(action_set, &grab_action_info, &grab_action_float)
+	if result != .SUCCESS {panic("Failed to create grab action")}
+
+	haptic_action: xr.Action
+	haptic_info := xr.ActionCreateInfo {
+		sType               = .ACTION_CREATE_INFO,
+		actionType          = .VIBRATION_OUTPUT,
+		actionName          = xr.make_string("haptic", 64),
+		localizedActionName = xr.make_string("Haptic Vibration", 128),
+		countSubactionPaths = 2,
+		subactionPaths      = &hand_paths[0],
+	}
+	result = xr.CreateAction(action_set, &haptic_info, &haptic_action)
+	if result != .SUCCESS {panic("Failed to create haptic action")}
+
+
+	// Suggest Simple Controller action mapping
+	simple_path: xr.Path
+	result = xr.StringToPath(openxr, "/interaction_profiles/khr/simple_controller", &simple_path)
+	if result != .SUCCESS {panic("Failed to create simple controller path")}
+
+	simple_bindings := [?]xr.ActionSuggestedBinding{
+		{action = hand_pose_action, binding = grip_pose_paths[0]},
+		{action = hand_pose_action, binding = grip_pose_paths[1]},
+		{action = grab_action_float, binding = select_click_paths[0]},
+		{action = grab_action_float, binding = select_click_paths[1]},
+		{action = haptic_action, binding = haptic_paths[0]},
+		{action = haptic_action, binding = haptic_paths[1]},
+	}
+
+	simple_profile := xr.InteractionProfileSuggestedBinding {
+		sType                  = .INTERACTION_PROFILE_SUGGESTED_BINDING,
+		interactionProfile     = simple_path,
+		countSuggestedBindings = len(simple_bindings),
+		suggestedBindings      = &simple_bindings[0],
+	}
+
+	result = xr.SuggestInteractionProfileBindings(openxr, &simple_profile)
+	if result != .SUCCESS {panic("Failed to suggest simple controller binding")}
+
+
+	// Suggest Valve Index Controller action mapping
+	valve_index_path: xr.Path
+	result = xr.StringToPath(openxr, "/interaction_profiles/valve/index_controller", &valve_index_path)
+	if result != .SUCCESS {panic("Failed to create valve index controller path")}
+
+	valve_index_bindings := [?]xr.ActionSuggestedBinding{
+		{action = hand_pose_action, binding = grip_pose_paths[0]},
+		{action = hand_pose_action, binding = grip_pose_paths[1]},
+		{action = grab_action_float, binding = trigger_value_paths[0]},
+		{action = grab_action_float, binding = trigger_value_paths[1]},
+		{action = haptic_action, binding = haptic_paths[0]},
+		{action = haptic_action, binding = haptic_paths[1]},
+	}
+
+	valve_index_profile := xr.InteractionProfileSuggestedBinding {
+		sType                  = .INTERACTION_PROFILE_SUGGESTED_BINDING,
+		interactionProfile     = valve_index_path,
+		countSuggestedBindings = len(valve_index_bindings),
+		suggestedBindings      = &valve_index_bindings[0],
+	}
+
+	result = xr.SuggestInteractionProfileBindings(openxr, &valve_index_profile)
+	if result != .SUCCESS {panic("Failed to suggest simple controller binding")}
+
+	// Attach the action sets to the session
+	attach_info := xr.SessionActionSetsAttachInfo {
+		sType           = .SESSION_ACTION_SETS_ATTACH_INFO,
+		countActionSets = 1,
+		actionSets      = &action_set,
+	}
+	result = xr.AttachSessionActionSets(session, &attach_info)
+	if result != .SUCCESS {panic("Failed to attach action set to session")}
+
+	return
+}
+
+
 xr_subsystem_init :: proc() -> (subsytem: Xr_Subsystem) {
 	vk.load_proc_addresses_global(rawptr(vkGetInstanceProcAddr))
 	openxr := xr_init_instance()
@@ -811,6 +960,7 @@ xr_subsystem_init :: proc() -> (subsytem: Xr_Subsystem) {
 	depth_image_views := xr_create_view_image_views(device, depth_images, depth_format, true)
 	extents := create_extents(view_confs)
 	fence := create_fence(device)
+	action_set := init_action_set(openxr, session)
 
 	pipeline, pipeline_layout := create_graphics_pipeline(device)
 	command_pool := create_command_pool(device, 0)
@@ -833,6 +983,7 @@ xr_subsystem_init :: proc() -> (subsytem: Xr_Subsystem) {
 		space              = space,
 		colour_swapchains  = colour_swapchains,
 		depth_swapchains   = depth_swapchains,
+		action_set         = action_set,
 		vulkan             = vulkan,
 		device             = device,
 		queue              = queue,
@@ -945,29 +1096,25 @@ handle_session_state_change :: proc(subsystem: ^Xr_Subsystem, event: ^xr.EventDa
 }
 
 handle_interaction_profile_change :: proc(subsystem: ^Xr_Subsystem, event: ^xr.EventDataInteractionProfileChanged) {
+	using subsystem
+
 	fmt.println("EVENT: interaction profile changed!")
+	result: xr.Result
 
-	// for i in 0 ..< 2 {
-	// 	profile_state := xr.InteractionProfileState {
-	// 		sType = .INTERACTION_PROFILE_STATE,
-	// 	}
-	// 	err := xr.GetCurrentInteractionProfile(session, xr_hand_paths[i], &profile_state)
-	// 	if err != .Success {
-	// 		panic("Failed to get interaction profile")
-	// 	}
+	// Should be able to just get any action path
+	left_hand_path: xr.Path
+	xr.StringToPath(openxr, "/user/hand/left", &left_hand_path)
 
-	// 	prof := profile_state.interactionProfile
-	// 	strl: u32
-	// 	profile_str: [xr.MAX_PATH_LENGTH]u8
-	// 	err = xr.path_to_string(xr_instance, prof, xr.MAX_PATH_LENGTH, &strl, cstring(&profile_str[0]))
-	// 	if err != .Success {
-	// 		fmt.println(err)
-	// 		fmt.println("Failed to get profile string")
-	// 	} else {
-	// 		fmt.printf("Event: Interaction profile changed for %d: %s\n", i, cstring(&profile_str[0]))
-	// 	}
+	profile_state: xr.InteractionProfileState
+	result = xr.GetCurrentInteractionProfile(session, left_hand_path, &profile_state)
+	if result != .SUCCESS {panic("Failed to get interaction profile")}
 
-	// }
+	strlen: u32
+	profile_string: [xr.MAX_PATH_LENGTH]u8
+	result = xr.PathToString(openxr, profile_state.interactionProfile, strlen, &strlen, cstring(&profile_string[0]))
+	if result != .SUCCESS {panic("Failed to get ineraction profile string")}
+	fmt.printf("Event: Interaction profile changed for /user/hand/left: %s\n", cstring(&profile_string[0]))
+
 }
 
 render_frame :: proc(subsystem: ^Xr_Subsystem, eye_index, colour_index, depth_index: u32) {
@@ -1057,7 +1204,6 @@ render_frame :: proc(subsystem: ^Xr_Subsystem, eye_index, colour_index, depth_in
 		// pSignalSemaphores    = &signal_semaphores[0],
 	}
 
-	fmt.println(queue)
 	result = vk.QueueSubmit(queue, 1, &submit_info, fence)
 	if result != .SUCCESS {panic("Queue submission failed")}
 
@@ -1212,7 +1358,6 @@ xr_frame :: proc(subsystem: ^Xr_Subsystem) {
 		}
 	}
 
-	fmt.println(views[0].pose.position)
 
 	for i in 0 ..< u32(2) {
 		if !bool(frame_state.shouldRender) {
