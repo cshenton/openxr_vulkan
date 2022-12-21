@@ -8,6 +8,13 @@ import SDL "vendor:sdl2"
 import vk "vendor:vulkan"
 import xr "openxr"
 
+// TODO
+// Allocate command buffer per eye image
+// Allocate fence per eye image
+// Think we don't need semaphores yet
+// plug queue family, etc. into command buffer recording
+// wait fence
+
 XR_INSTANCE_EXTENSIONS := [?]cstring{xr.EXT_DEBUG_UTILS_EXTENSION_NAME, xr.KHR_VULKAN_ENABLE_EXTENSION_NAME}
 VK_INSTANCE_EXTENSIONS := [?]cstring{vk.EXT_DEBUG_UTILS_EXTENSION_NAME}
 VK_DEVICE_EXTENSIONS := [?]cstring{vk.KHR_DYNAMIC_RENDERING_EXTENSION_NAME}
@@ -32,6 +39,8 @@ Xr_Subsystem :: struct {
 	vulkan:             vk.Instance,
 	physical_device:    vk.PhysicalDevice,
 	device:             vk.Device,
+	queue:              vk.Queue,
+	queue_family_index: u32,
 	colour_images:      [][]xr.SwapchainImageVulkanKHR,
 	depth_images:       [][]xr.SwapchainImageVulkanKHR,
 	colour_image_views: [][]vk.ImageView,
@@ -40,7 +49,14 @@ Xr_Subsystem :: struct {
 	pipeline_layout:    vk.PipelineLayout,
 	pipeline:           vk.Pipeline,
 	command_pool:       vk.CommandPool,
-	command_buffers:    [2]vk.CommandBuffer,
+	command_buffers:    [][]vk.CommandBuffer,
+	fence:              vk.Fence,
+
+	// Frame state
+	session_state:      xr.SessionState,
+	quit_mainloop:      bool,
+	run_framecycle:     bool,
+	session_running:    bool,
 }
 
 xr_debug_callback :: proc "c" (
@@ -319,13 +335,27 @@ xr_create_vulkan_instance :: proc(instance: xr.Instance, system: xr.SystemId) ->
 		pApplicationInfo        = &application_info,
 		enabledExtensionCount   = u32(len(extension_names)),
 		ppEnabledExtensionNames = &extension_names[0],
-		// enabledLayerCount       = len(VK_INSTANCE_LAYERS),
-		// ppEnabledLayerNames     = &VK_INSTANCE_LAYERS[0],
+		enabledLayerCount       = len(VK_INSTANCE_LAYERS),
+		ppEnabledLayerNames     = &VK_INSTANCE_LAYERS[0],
 	}
 	vk_result := vk.CreateInstance(&instance_info, nil, &vk_instance)
 	if vk_result != .SUCCESS {panic("Vulkan instance creation failed")}
 	vk.load_proc_addresses_instance(vk_instance)
 
+	return
+}
+
+pick_device_queue_family :: proc(physical_device: vk.PhysicalDevice) -> (queue_family_index: u32) {
+	queue_family_count: u32
+	vk.GetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, nil)
+	queue_families := make([]vk.QueueFamilyProperties, queue_family_count)
+	defer delete(queue_families)
+	vk.GetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, &queue_families[0])
+	for family, i in queue_families {
+		if .GRAPHICS not_in family.queueFlags {continue}
+		queue_family_index = u32(i)
+		break
+	}
 	return
 }
 
@@ -337,6 +367,8 @@ xr_create_vulkan_device :: proc(
 ) -> (
 	device: vk.Device,
 	physical_device: vk.PhysicalDevice,
+	queue: vk.Queue,
+	queue_family_index: u32,
 ) {
 	result := xr.GetVulkanGraphicsDeviceKHR(instance, system, vk_instance, &physical_device)
 	if result != .SUCCESS {panic("Failed to get Vulkan PhysicalDevice")}
@@ -349,12 +381,11 @@ xr_create_vulkan_device :: proc(
 		delete(extension_names)
 	}
 
-	// TODO: actually query queue families
-	queue_index: u32 = 0
+	queue_family_index = pick_device_queue_family(physical_device)
 	queue_priority := f32(1)
 	queue_create_info := vk.DeviceQueueCreateInfo {
 		sType            = .DEVICE_QUEUE_CREATE_INFO,
-		queueFamilyIndex = queue_index,
+		queueFamilyIndex = queue_family_index,
 		queueCount       = 1,
 		pQueuePriorities = &queue_priority,
 	}
@@ -368,8 +399,8 @@ xr_create_vulkan_device :: proc(
 		queueCreateInfoCount    = 1,
 		pQueueCreateInfos       = &queue_create_info,
 		pEnabledFeatures        = &vk.PhysicalDeviceFeatures{},
-		// enabledLayerCount       = len(VK_DEVICE_LAYERS),
-		// ppEnabledLayerNames     = &VK_DEVICE_LAYERS[0],
+		enabledLayerCount       = len(VK_DEVICE_LAYERS),
+		ppEnabledLayerNames     = &VK_DEVICE_LAYERS[0],
 		enabledExtensionCount   = u32(len(extension_names)),
 		ppEnabledExtensionNames = &extension_names[0],
 	}
@@ -378,6 +409,8 @@ xr_create_vulkan_device :: proc(
 		panic("Failed to create device")
 	}
 	vk.load_proc_addresses_device(device)
+
+	vk.GetDeviceQueue(device, queue_family_index, 0, &queue)
 	return
 }
 
@@ -502,7 +535,12 @@ xr_create_colour_swapchains :: proc(
 	colour_images = make([][]xr.SwapchainImageVulkanKHR, view_count)
 
 	for i in 0 ..< view_count {
-		colour_swapchains[i] = xr_create_swapchain(session, view_confs[i], colour_format, {.SAMPLED, .COLOR_ATTACHMENT})
+		colour_swapchains[i] = xr_create_swapchain(
+			session,
+			view_confs[i],
+			colour_format,
+			{.SAMPLED, .COLOR_ATTACHMENT, .TRANSFER_DST},
+		)
 		colour_images[i] = xr_get_swapchain_images(colour_swapchains[i])
 	}
 
@@ -724,18 +762,35 @@ create_command_pool :: proc(device: vk.Device, queue_index: u32) -> (command_poo
 	return
 }
 
-create_command_buffers :: proc(device: vk.Device, command_pool: vk.CommandPool) -> (command_buffers: [2]vk.CommandBuffer) {
-	command_buffer_info := vk.CommandBufferAllocateInfo {
-		sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
-		commandPool        = command_pool,
-		level              = .PRIMARY,
-		commandBufferCount = 2,
+create_command_buffers :: proc(
+	device: vk.Device,
+	command_pool: vk.CommandPool,
+	image_views: [][]vk.ImageView,
+) -> (
+	command_buffers: [][]vk.CommandBuffer,
+) {
+	command_buffers = make([][]vk.CommandBuffer, len(image_views))
+	for bufs, i in &command_buffers {
+		bufs = make([]vk.CommandBuffer, len(image_views[i]))
+		command_buffer_info := vk.CommandBufferAllocateInfo {
+			sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
+			commandPool        = command_pool,
+			level              = .PRIMARY,
+			commandBufferCount = u32(len(bufs)),
+		}
+		result := vk.AllocateCommandBuffers(device, &command_buffer_info, &command_buffers[i][0])
+		if result != .SUCCESS {panic("Command Buffer allocation failed")}
 	}
 
-	result := vk.AllocateCommandBuffers(device, &command_buffer_info, &command_buffers[0])
-	if result != .SUCCESS {
-		panic("Command Buffer allocation failed")
+	return
+}
+
+create_fence :: proc(device: vk.Device) -> (fence: vk.Fence) {
+	fence_info := vk.FenceCreateInfo {
+		sType = .FENCE_CREATE_INFO,
 	}
+	result := vk.CreateFence(device, &fence_info, nil, &fence)
+	if result != .SUCCESS {panic("Fence creation failed")}
 	return
 }
 
@@ -746,7 +801,7 @@ xr_subsystem_init :: proc() -> (subsytem: Xr_Subsystem) {
 	system, system_properties := xr_get_system_and_properties(openxr)
 	view_confs := xr_get_view_configs(openxr, system)
 	vulkan := xr_create_vulkan_instance(openxr, system)
-	device, physical_device := xr_create_vulkan_device(openxr, system, vulkan)
+	device, physical_device, queue, queue_family_index := xr_create_vulkan_device(openxr, system, vulkan)
 	session := xr_init_session(openxr, system, vulkan, physical_device, device)
 	space := xr_init_space(session)
 	colour_format, depth_format := xr_query_formats(session)
@@ -755,10 +810,11 @@ xr_subsystem_init :: proc() -> (subsytem: Xr_Subsystem) {
 	colour_image_views := xr_create_view_image_views(device, colour_images, colour_format, false)
 	depth_image_views := xr_create_view_image_views(device, depth_images, depth_format, true)
 	extents := create_extents(view_confs)
+	fence := create_fence(device)
 
 	pipeline, pipeline_layout := create_graphics_pipeline(device)
 	command_pool := create_command_pool(device, 0)
-	command_buffers := create_command_buffers(device, command_pool)
+	command_buffers := create_command_buffers(device, command_pool, colour_image_views)
 	// image_available_semaphores, render_finished_semaphores, in_flight_fences := app_create_sync_objects(device)
 
 	// Render loop
@@ -779,6 +835,8 @@ xr_subsystem_init :: proc() -> (subsytem: Xr_Subsystem) {
 		depth_swapchains   = depth_swapchains,
 		vulkan             = vulkan,
 		device             = device,
+		queue              = queue,
+		queue_family_index = queue_family_index,
 		physical_device    = physical_device,
 		colour_images      = colour_images,
 		depth_images       = depth_images,
@@ -789,6 +847,7 @@ xr_subsystem_init :: proc() -> (subsytem: Xr_Subsystem) {
 		pipeline           = pipeline,
 		command_pool       = command_pool,
 		command_buffers    = command_buffers,
+		fence              = fence,
 	}
 	return
 }
@@ -842,154 +901,201 @@ xr_pump_events :: proc(subsystem: ^Xr_Subsystem) {
 
 }
 
+handle_instance_loss_pending :: proc(subsystem: ^Xr_Subsystem, event: ^xr.EventDataInstanceLossPending) {
+	using subsystem
+	fmt.printf("EVENT: instance loss pending at %v! Destroying instance.\n", event.lossTime)
+	quit_mainloop = true
+}
+
+handle_session_state_change :: proc(subsystem: ^Xr_Subsystem, event: ^xr.EventDataSessionStateChanged) {
+	using subsystem
+	result: xr.Result
+
+	fmt.printf("EVENT: session state changed from %v to %v\n", session_state, event.state)
+	session_state = event.state
+
+	switch (session_state) 
+	{
+	case .IDLE, .UNKNOWN:
+		run_framecycle = false
+	case .FOCUSED, .SYNCHRONIZED, .VISIBLE:
+		run_framecycle = true
+	case .READY:
+		fmt.println("Session Ready")
+		run_framecycle = true
+		if session_running {return}
+		begin_info := xr.SessionBeginInfo {
+			sType                        = .SESSION_BEGIN_INFO,
+			primaryViewConfigurationType = .PRIMARY_STEREO,
+		}
+		result = xr.BeginSession(session, &begin_info)
+		if result != .SUCCESS {panic("Failed to begin session")}
+	case .STOPPING:
+		run_framecycle = false
+		if !session_running {return}
+		result = xr.EndSession(session)
+		if result != .SUCCESS {panic("Failed to end session")}
+		session_running = false
+	case .LOSS_PENDING, .EXITING:
+		result = xr.DestroySession(session)
+		if result != .SUCCESS {panic("Failed to destroy session")}
+		quit_mainloop = true
+		run_framecycle = false
+	}
+}
+
+handle_interaction_profile_change :: proc(subsystem: ^Xr_Subsystem, event: ^xr.EventDataInteractionProfileChanged) {
+	fmt.println("EVENT: interaction profile changed!")
+
+	// for i in 0 ..< 2 {
+	// 	profile_state := xr.InteractionProfileState {
+	// 		sType = .INTERACTION_PROFILE_STATE,
+	// 	}
+	// 	err := xr.GetCurrentInteractionProfile(session, xr_hand_paths[i], &profile_state)
+	// 	if err != .Success {
+	// 		panic("Failed to get interaction profile")
+	// 	}
+
+	// 	prof := profile_state.interactionProfile
+	// 	strl: u32
+	// 	profile_str: [xr.MAX_PATH_LENGTH]u8
+	// 	err = xr.path_to_string(xr_instance, prof, xr.MAX_PATH_LENGTH, &strl, cstring(&profile_str[0]))
+	// 	if err != .Success {
+	// 		fmt.println(err)
+	// 		fmt.println("Failed to get profile string")
+	// 	} else {
+	// 		fmt.printf("Event: Interaction profile changed for %d: %s\n", i, cstring(&profile_str[0]))
+	// 	}
+
+	// }
+}
+
+render_frame :: proc(subsystem: ^Xr_Subsystem, eye_index, colour_index, depth_index: u32) {
+	using subsystem
+	result: vk.Result
+
+	current_frame: u32 = 1
+	command_buffer := command_buffers[eye_index][colour_index]
+	colour_image := colour_images[eye_index][colour_index].image
+	colour_image_view := colour_image_views[eye_index][colour_index]
+	depth_image := depth_images[eye_index][depth_index].image
+	depth_image_view := depth_image_views[eye_index][depth_index]
+	extent := extents[eye_index]
+
+	vk.ResetCommandBuffer(command_buffer, {})
+	begin_info := vk.CommandBufferBeginInfo {
+		sType = .COMMAND_BUFFER_BEGIN_INFO,
+	}
+
+	result = vk.BeginCommandBuffer(command_buffer, &begin_info)
+	if result != .SUCCESS {panic("Command Buffer recording failed")}
+
+	memory_barrier := vk.ImageMemoryBarrier {
+		sType = .IMAGE_MEMORY_BARRIER,
+		srcAccessMask = {},
+		dstAccessMask = vk.AccessFlags{.TRANSFER_WRITE},
+		oldLayout = .UNDEFINED,
+		newLayout = .PRESENT_SRC_KHR,
+		srcQueueFamilyIndex = queue_family_index,
+		dstQueueFamilyIndex = queue_family_index,
+		image = colour_image,
+		subresourceRange = vk.ImageSubresourceRange{
+			aspectMask = {.COLOR},
+			baseMipLevel = 0,
+			levelCount = 1,
+			baseArrayLayer = 0,
+			layerCount = 1,
+		},
+	}
+	// vk.CmdPipelineBarrier(command_buffer, {.TOP_OF_PIPE}, {.TRANSFER}, {}, 0, nil, 0, nil, 1, &memory_barrier)
+
+	color_attachment := vk.RenderingAttachmentInfo {
+		sType = .RENDERING_ATTACHMENT_INFO,
+		imageView = colour_image_view,
+		imageLayout = .ATTACHMENT_OPTIMAL,
+		loadOp = .CLEAR,
+		storeOp = .STORE,
+		clearValue = vk.ClearValue{color = {float32 = {0, 0, 0, 0}}},
+	}
+	rendering_info := vk.RenderingInfo {
+		sType = .RENDERING_INFO,
+		renderArea = vk.Rect2D{offset = {0, 0}, extent = extent},
+		layerCount = 1,
+		colorAttachmentCount = 1,
+		pColorAttachments = &color_attachment,
+	}
+	vk.CmdBeginRenderingKHR(command_buffer, &rendering_info)
+	vk.CmdBindPipeline(command_buffer, .GRAPHICS, pipeline)
+	viewport := vk.Viewport {
+		x        = 0,
+		y        = 0,
+		width    = f32(extent.width),
+		height   = f32(extent.height),
+		minDepth = 0.0,
+		maxDepth = 1.0,
+	}
+	vk.CmdSetViewport(command_buffer, 0, 1, &viewport)
+	scissor := vk.Rect2D {
+		offset = {0, 0},
+		extent = extent,
+	}
+	vk.CmdSetScissor(command_buffer, 0, 1, &scissor)
+	vk.CmdDraw(command_buffer, 3, 1, 0, 0)
+	vk.CmdEndRenderingKHR(command_buffer)
+
+	result = vk.EndCommandBuffer(command_buffer)
+	if result != .SUCCESS {panic("Command Buffer recording failed")}
+
+	submit_info := vk.SubmitInfo {
+		sType              = .SUBMIT_INFO,
+		// waitSemaphoreCount = 1,
+		// pWaitSemaphores      = &wait_semaphores[0],
+		// pWaitDstStageMask    = &wait_stages[0],
+		commandBufferCount = 1,
+		pCommandBuffers    = &command_buffer,
+		// signalSemaphoreCount = 1,
+		// pSignalSemaphores    = &signal_semaphores[0],
+	}
+
+	fmt.println(queue)
+	result = vk.QueueSubmit(queue, 1, &submit_info, fence)
+	if result != .SUCCESS {panic("Queue submission failed")}
+
+	vk.WaitForFences(device, 1, &fence, true, max(u64))
+	vk.ResetFences(device, 1, &fence)
+
+}
+
 xr_frame :: proc(subsystem: ^Xr_Subsystem) {
 	using subsystem
 
 	result: xr.Result
 
-	quit_mainloop: bool
-	run_framecycle: bool
-	session_running: bool
-	session_state: xr.SessionState
-
-	// Handle runtime Events
-	// we do this before xrWaitFrame() so we can go idle or
-	// break out of the main render loop as early as possible and don't have to
-	// uselessly render or submit one. Calling xrWaitFrame commits you to
-	// calling xrBeginFrame eventually.
-	runtime_event := xr.EventDataBuffer {
-		sType = .EVENT_DATA_BUFFER,
-	}
+	// Pump event loop
+	runtime_event: xr.EventDataBuffer
 	poll_result := xr.PollEvent(openxr, &runtime_event)
-	for poll_result == .SUCCESS {
-		#partial switch (runtime_event.sType) 
-		{
+	for poll_result != .EVENT_UNAVAILABLE {
+		if poll_result != .SUCCESS {panic("Failed to poll events")}
+
+		#partial switch (runtime_event.sType) {
 		case .EVENT_DATA_INSTANCE_LOSS_PENDING:
-			event := cast(^xr.EventDataInstanceLossPending)&runtime_event
-			fmt.printf("EVENT: instance loss pending at %v! Destroying instance.\n", event.lossTime)
-			quit_mainloop = true
-			continue
+			handle_instance_loss_pending(subsystem, cast(^xr.EventDataInstanceLossPending)&runtime_event)
 		case .EVENT_DATA_SESSION_STATE_CHANGED:
-			event := cast(^xr.EventDataSessionStateChanged)&runtime_event
-			fmt.printf("EVENT: session state changed from %v to %v\n", session_state, event.state)
-			session_state = event.state
-
-			/*
-				 * react to session state changes, see OpenXR spec 9.3 diagram. What we need to react to:
-				 *
-				 * * READY -> xrBeginSession STOPPING -> xrEndSession (note that the same session can be restarted)
-				 * * EXITING -> xrDestroySession (EXITING only happens after we went through STOPPING and called
-				 *
-				 * After exiting it is still possible to create a new session but we don't do that here.
-				 *
-				 * * IDLE -> don't run render loop, but keep polling for events
-				 * * SYNCHRONIZED, VISIBLE, FOCUSED -> run render loop
-				 */
-			switch (session_state) 
-			{
-			// skip render loop, keep polling
-			case .IDLE, .UNKNOWN:
-				run_framecycle = false
-
-			// do nothing, run render loop normally
-			case .FOCUSED, .SYNCHRONIZED, .VISIBLE:
-				run_framecycle = true
-
-			// begin session and then run render loop
-			case .READY:
-				// start session only if it is not running, i.e. not when we already called xrBeginSession
-				// but the runtime did not switch to the next state yet
-				if !session_running {
-					result = xr.BeginSession(
-						session,
-						&xr.SessionBeginInfo{sType = .SESSION_BEGIN_INFO, primaryViewConfigurationType = .PRIMARY_STEREO},
-					)
-
-					if result != .SUCCESS {
-						panic("Failed to begin session")
-					}
-
-					session_running = true
-				}
-				// after beginning the session, run render loop
-				run_framecycle = true
-
-			// end session, skip render loop, keep polling for next state change
-			case .STOPPING:
-				// end session only if it is running, i.e. not when we already called xrEndSession but the
-				// runtime did not switch to the next state yet
-				if session_running {
-					result = xr.EndSession(session)
-					if result != .SUCCESS {
-						panic("Failed to end session")
-					}
-					session_running = false
-				}
-				// after ending the session, don't run render loop
-				run_framecycle = false
-
-			// destroy session, skip render loop, exit render loop and quit
-			case .LOSS_PENDING, .EXITING:
-				result = xr.DestroySession(session)
-				if result != .SUCCESS {
-					panic("Failed to destroy session")
-				}
-				quit_mainloop = true
-				run_framecycle = false
-			}
-
+			handle_session_state_change(subsystem, cast(^xr.EventDataSessionStateChanged)&runtime_event)
 		case .EVENT_DATA_INTERACTION_PROFILE_CHANGED:
-			fmt.println("EVENT: interaction profile changed!")
-
-		// for i in 0 ..< 2 {
-		// 	profile_state := xr.InteractionProfileState {
-		// 		sType = .INTERACTION_PROFILE_STATE,
-		// 	}
-		// 	err := xr.GetCurrentInteractionProfile(session, xr_hand_paths[i], &profile_state)
-		// 	if err != .Success {
-		// 		panic("Failed to get interaction profile")
-		// 	}
-
-		// 	prof := profile_state.interactionProfile
-		// 	strl: u32
-		// 	profile_str: [xr.MAX_PATH_LENGTH]u8
-		// 	err = xr.path_to_string(xr_instance, prof, xr.MAX_PATH_LENGTH, &strl, cstring(&profile_str[0]))
-		// 	if err != .Success {
-		// 		fmt.println(err)
-		// 		fmt.println("Failed to get profile string")
-		// 	} else {
-		// 		fmt.printf("Event: Interaction profile changed for %d: %s\n", i, cstring(&profile_str[0]))
-		// 	}
-
-		// }
+			handle_interaction_profile_change(subsystem, cast(^xr.EventDataInteractionProfileChanged)&runtime_event)
 		case:
 			fmt.printf("Unhandled event (type {})\n", runtime_event.sType)
 		}
-
-		runtime_event.sType = .EVENT_DATA_BUFFER
 		poll_result = xr.PollEvent(openxr, &runtime_event)
 	}
 
-	if poll_result == .EVENT_UNAVAILABLE {
-		// processed all events in the queue
-	} else {
-		fmt.println("Failed to poll events!")
-		return
-	}
-
-
-	if !run_framecycle {
-		return
-	}
+	if !run_framecycle {return}
 
 	// Wait for our turn to do head-pose dependent computation and render a frame
-	frame_state := xr.FrameState {
-		sType = .FRAME_STATE,
-	}
-	frame_wait_info := xr.FrameWaitInfo {
-		sType = .FRAME_WAIT_INFO,
-	}
-	result = xr.WaitFrame(session, &frame_wait_info, &frame_state)
+	// Display time prediction happens here, so we want to do as much work as we can before this
+	frame_state: xr.FrameState
+	result = xr.WaitFrame(session, &xr.FrameWaitInfo{sType = .FRAME_WAIT_INFO}, &frame_state)
 	if result != .SUCCESS {panic("Failed to wait frame")}
 
 	//! @todo Move this action processing to before xrWaitFrame, probably.
@@ -1106,7 +1212,9 @@ xr_frame :: proc(subsystem: ^Xr_Subsystem) {
 		}
 	}
 
-	for i in 0 ..< 2 {
+	fmt.println(views[0].pose.position)
+
+	for i in 0 ..< u32(2) {
 		if !bool(frame_state.shouldRender) {
 			fmt.println("should_render = false, skipping frame")
 			continue
@@ -1141,10 +1249,14 @@ xr_frame :: proc(subsystem: ^Xr_Subsystem) {
 		result = xr.WaitSwapchainImage(depth_swapchains[i], &depth_wait_info)
 		if result != .SUCCESS {panic("Failed to wait for swapchain image")}
 
+		// RENDER
 
-		// TODO:
-		// Grab our image view ([i][foo_index])
-		// Record and queue command
+		// Maybe we should AcquireImage, build command buffer, WaitImage, submit command buffer
+		// Weird that we don't get any way to pass semaphores to present
+		// Do I have to sync on host? eww
+		render_frame(subsystem, i, colour_index, depth_index)
+
+		// END RENDER
 
 		colour_release_info := xr.SwapchainImageReleaseInfo {
 			sType = .SWAPCHAIN_IMAGE_RELEASE_INFO,
@@ -1169,7 +1281,7 @@ xr_frame :: proc(subsystem: ^Xr_Subsystem) {
 
 	submitted_layer_count: u32 = 1
 	submitted_layers := [1]^xr.CompositionLayerBaseHeader{cast(^xr.CompositionLayerBaseHeader)&projection_layer}
-	if .ORIENTATION_VALID in view_state.viewStateFlags {
+	if .ORIENTATION_VALID not_in view_state.viewStateFlags {
 		fmt.println("submitting 0 layers because orientation is invalid")
 		submitted_layer_count = 0
 	}
